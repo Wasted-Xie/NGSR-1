@@ -1,0 +1,26 @@
+# 数据集（体积大，不属于算法本身）
+data/
+
+# 实验产物与临时脚本
+temp/
+
+# 内部资料
+# 注意：用目录级排除，不要写具体文件名——文件名会随本文件一起公开
+docs-hide/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

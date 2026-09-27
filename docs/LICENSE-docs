@@ -1,0 +1,39 @@
+# 文档许可
+
+本目录（`docs/`）下的**文档**采用
+**Creative Commons Attribution-ShareAlike 4.0 International（CC BY-SA 4.0）** 许可。
+
+Copyright (c) 2026 Wasted-Xie
+
+## 你可以
+
+- **共享** — 以任何媒介或格式复制、发行本作品
+- **改编** — 重混、转换本作品，或基于本作品进行创作
+- **用于任何目的，包括商业目的**
+
+## 但必须遵守
+
+- **署名（BY）** — 必须给出适当的署名（标明原作者）、提供指向本许可的链接，
+  并**说明是否作出了修改**。不得以任何方式暗示原作者为你或你的使用背书。
+- **相同方式共享（SA）** — 如果重混、转换或基于本作品创作，**必须依据相同的许可**
+  分发你的贡献。
+
+## 完整法律文本
+
+- 中文：https://creativecommons.org/licenses/by-sa/4.0/legalcode.zh-Hans
+- English: https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+## 不适用范围
+
+本许可**仅适用于文档**。以下目录中的代码适用 **Apache License 2.0**，
+见仓库根目录的 `LICENSE`：
+
+    src/       算法实现
+    scripts/   训练与实验脚本
+    tests/     测试
+
+## 一句话说明
+
+允许任何人（包括商业使用者）使用与改编这些文档，但**必须署名原作者**，
+且**改编后的文档必须同样以 CC BY-SA 4.0 开放**。这既不妨碍正常的技术使用，
+也阻止了把本文档改头换面后闭源据为己有的行为。

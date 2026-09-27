@@ -1,0 +1,15 @@
+Next-Generation Super-Resolution (NGSR-1)
+Copyright (c) 2026 Wasted-Xie
+
+本作品包含由第三方开发的软件组件，其许可如下：
+
+  PyTorch       BSD-3-Clause    https://github.com/pytorch/pytorch
+  NumPy         BSD-3-Clause    https://github.com/numpy/numpy
+  Pillow        HPND            https://github.com/python-pillow/Pillow
+  Python        PSF-2.0         https://www.python.org/
+
+--------------------------------------------------------------------
+说明（Apache-2.0 第 4(d) 条）
+--------------------------------------------------------------------
+若你分发本作品或其衍生作品，必须一并保留本文件中上述归属声明的内容。
+本文件内容仅供参考，不修改 LICENSE 中的任何条款。
