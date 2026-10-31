@@ -92,31 +92,48 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         self, x: torch.Tensor, degradation: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
-        x: (B, N, C)
+        x: (B, N, C) 单流，或 (B, N, k, C) 多流
         degradation: (B, 1) 或 (B, N, 1) 退化程度估计（0~1），可选
 
         返回
         ----
-        (B, N, C) 经流形约束后的输出
+        与输入同形状。单流输入时，双随机矩阵退化为 1×1 的单位矩阵，
+        故输出与输入完全相等（恒等映射）。
+
+        修复说明
+        --------
+        原实现只取 `alpha` 的对角均值 `diag_mean` 当标量用，并对残差流做
+        `x + strength * (diag_mean - 1) * x`。由于双随机矩阵的对角均值恒
+        ≤ 1（仅在置换矩阵时取 1），该式**只能衰减、永不增强**：
+        `init_alpha=0.01` 时为 0.25，`strength=0.5` 时每层乘 0.625，
+        6 层后约 0.06，等价于逐层遗忘早期特征，与「恢复恒等映射」的
+        设计目标相反。
+
+        现改为对 k 条流做真正的混合 `alpha @ streams`，并把约束写成
+        相对恒等的残差增量 `streams + strength * (mixed - streams)`。
+        单流时 `alpha` 为 1×1 单位阵、`mixed == streams`，输出恒等于输入；
+        多流时行为符合设计意图。
         """
-        # Sinkhorn 投影得到双随机矩阵
-        alpha = sinkhorn_knopp(self.log_alpha, self.sinkhorn_iters)
+        single_stream = x.dim() == 3
+        streams = x.unsqueeze(2) if single_stream else x  # (B, N, k, C)
+        num_streams = streams.shape[2]
+
+        # 按实际流数取子矩阵再做 Sinkhorn 投影，得到 k×k 双随机矩阵
+        alpha = sinkhorn_knopp(
+            self.log_alpha[:num_streams, :num_streams], self.sinkhorn_iters
+        )
+        mixed = torch.einsum("bnkc,kj->bnjc", streams, alpha)
 
         # 动态约束强度（R53：根据退化程度调整）
         if degradation is not None:
             d = degradation.reshape(x.shape[0], -1).mean(dim=1, keepdim=True)
-            strength = self.strength_gate(d).reshape(-1, 1, 1)
+            strength = self.strength_gate(d).reshape(-1, 1, 1, 1)
         else:
             strength = 0.5
 
-        # 用混合矩阵的对角均值作为缩放因子，保持恒等映射性质
-        # （双随机矩阵的对角元素和接近 1，即近似恒等）
-        diag_mean = torch.diagonal(alpha).mean()
-
-        # 残差：x + strength * (diag_mean * x - x)
-        # 当 diag_mean -> 1 时退化为恒等映射
-        out = x + strength * (diag_mean - 1.0) * x
-        return out
+        # 相对恒等的残差增量：k=1 时 mixed == streams，输出即恒等
+        out = streams + strength * (mixed - streams)
+        return out.squeeze(2) if single_stream else out
 
 
 class HighPrecisionBypass(nn.Module):
