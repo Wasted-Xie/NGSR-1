@@ -31,6 +31,7 @@ class HybridBlock(nn.Module):
     设计文档 2.1 节数据流中的主干组成：
       低分辨率主干（全帧、不分块）
         ├─ 空间注意力（窗口 8x8/16x16/32x32）
+        ├─ 跨窗口局部混合（DWConv 3x3；弥补窗口注意力无法跨窗通信）
         ├─ 三级路由 MoE
         ├─ Engram 条件记忆
         └─ mHC 残差连接
@@ -66,6 +67,16 @@ class HybridBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, window_size, num_heads)
         self.ls1 = LayerScale(dim)
+
+        # 跨窗口局部混合（DWConv 3x3）
+        # 窗口注意力只在窗口内交互，主干里没有任何跨窗口通路，感受野被
+        # 锁死在 window_size 内（见 issue #1 与 tests/test_regressions.py）。
+        # 这里补一条深度方向的局部通路，让相邻窗口可以直接传递信息。
+        self.norm_conv = nn.LayerNorm(dim)
+        self.local_conv = nn.Conv2d(
+            dim, dim, 3, padding=1, groups=dim, bias=False
+        )
+        self.ls_conv = LayerScale(dim)
 
         # FFN（共享专家）
         self.norm2 = nn.LayerNorm(dim)
@@ -133,12 +144,20 @@ class HybridBlock(nn.Module):
         gate_prob = None
         hit_rate = None
 
+        b, n, c = x.shape
+
         # 注入理解层的逐 token 策略条件（保留空间分辨力）
         if strategy is not None:
             x = x + strategy
 
         # ---------- 空间注意力 ----------
         x = x + self.ls1(self.attn(self.norm1(x), h, w))
+
+        # ---------- 跨窗口局部混合 ----------
+        # 把 token 还原成特征图做一次 DWConv 3x3，让相邻窗口互通信息。
+        xc = self.norm_conv(x).transpose(1, 2).reshape(b, c, h, w)
+        xc = self.local_conv(xc).flatten(2).transpose(1, 2)
+        x = x + self.ls_conv(xc)
 
         # ---------- 共享专家 FFN ----------
         x = x + self.ls2(self.ffn(self.norm2(x)))
