@@ -418,11 +418,17 @@ class ThreeLevelMoE(nn.Module):
         gate_prob = torch.sigmoid(self.quality_gate[3](gate_feat))  # (B, N, 1)
 
         # ---------- 负载均衡辅助损失 ----------
-        # 组级：让各专家簇被均匀使用
+        # 参考 Switch Transformer 的 aux loss：num_clusters * Σ f_i * P_i
+        # 其中 f_i 是硬分配的频率（不可导），P_i 是路由概率的均值（可导）。
+        #
+        # 原实现只用了 f_i，且 f_i 来自 argmax -> one_hot，整条链不可导，
+        # aux_loss 是常量、梯度恒为零，负载均衡从未生效（见 issue #2）。
+        # 这里补上可导的 P_i 项，并保留硬频率作为目标分布。
         cluster_frac = F.one_hot(
             cluster_ids, self.num_clusters
         ).float().mean(dim=(0, 1))  # (num_clusters,)
-        aux_loss = (cluster_frac * self.num_clusters - 1.0).pow(2).mean()
+        cluster_prob = group_logits.softmax(dim=-1).mean(dim=(0, 1))
+        aux_loss = self.num_clusters * (cluster_frac * cluster_prob).sum()
 
         return {
             "out": out,
