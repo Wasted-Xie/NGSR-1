@@ -177,7 +177,7 @@ class HybridBlock(nn.Module):
 
         # ---------- Engram 条件记忆 ----------
         if self.use_engram and engram is not None:
-            eng = engram(self.norm4(x))
+            eng = engram(self.norm4(x), h, w)
             prior = self.engram_proj(eng["out"])
             gate = self.engram_gate(torch.cat([x, prior], dim=-1))
             x = x + self.ls4(gate * prior)
@@ -423,7 +423,7 @@ class UnderstandingLayer(nn.Module):
         # ---------- 分支 2：退化理解（逐像素，保留空间分布）----------
         deg_map = self.degradation_head(combined)  # (B, K+1, h, w)
         deg_tokens = deg_map.flatten(2).transpose(1, 2)  # (B, N, K+1)
-        degradation_map = deg_tokens[..., -1:]  # (B, N, 1)
+        degradation_map = torch.sigmoid(deg_tokens[..., -1:])  # (B, N, 1)
         degradation_type = deg_tokens[..., :-1].mean(dim=1)  # (B, K)
 
         # ---------- 分支 3：意图理解 ----------

@@ -79,8 +79,13 @@ check(
     "最大占比不超过预算",
     "%.0f%%（预算 35%%）" % (max_r * 100),
 )
+# 阈值说明：issue #5 补全主干口径后，分母的主要成分由「主干分辨率上的
+# 注意力 / FFN / 专家」变为「输入分辨率上的重建路径（fuse / bypass /
+# 两次上采样）」。占比趋势因此由递减转为递增（Low 0.81% → Max 2.97%），
+# 跨度由 2.7 倍变为约 3.7 倍。这仍属同一量级——「数量级畸变」指修订前
+# 固定 540p 时 Low 档那种 184% 的情形，故阈值放宽到 5 倍。
 check(
-    max_r / min_r < 3.0,
+    max_r / min_r < 5.0,
     "各档占比跨度合理（不再有数量级畸变）",
     "%.0f%% ~ %.0f%%，跨度 %.1f 倍"
     % (min_r * 100, max_r * 100, max_r / min_r),
@@ -164,7 +169,9 @@ banner("4. 超预算配置被拒绝")
 # ---------------------------------------------------------------------------
 
 try:
-    bad = SRConfig(main_blocks=2, understanding_dim_ratio=4.0)
+    # 注：issue #5 补全主干口径后，分母含 fuse/bypass/两次上采样等重建路径，
+    # 数值比原先的「三项和」大约一个数量级，故这里需用更大的 ratio 才能越界。
+    bad = SRConfig(main_blocks=2, understanding_dim_ratio=12.0)
     bad.validate()
     check(False, "超预算配置应被拒绝", "但未报错")
 except ValueError as e:
@@ -193,23 +200,27 @@ banner("5. 算力口径一致性（防止公式漂移）")
 from sr.analysis import estimate_flops  # noqa: E402
 
 print()
-print("  %-8s %14s %14s %14s" % ("档位", "config主干G", "analysis三项和G", "偏差"))
+print("  %-8s %14s %14s %14s" % ("档位", "config主干G", "analysis主干G", "偏差"))
 print("  " + "-" * 56)
 
 for tier in Tier:
     cfg = TIER_PRESETS[tier]
     fl = estimate_flops(cfg)
 
-    # 断言 1：主干口径 = 注意力 + 共享FFN + 私有专家
-    three = fl["attention"] + fl["shared_ffn"] + fl["private_experts"]
+    # 断言 1：主干口径 = analysis 全部主干项之和
+    # （total 减去理解层与 Engram 两个非主干项）。
+    # 原先只对拍「注意力 + 共享FFN + 私有专家」三项，而两侧当时都漏算
+    # fuse/bypass/上采样等路径，于是"对拍通过"掩盖了共同错误（issue #5/#8）。
+    # 补全后必须按完整口径对拍，任一侧再漂移都会立即失败。
+    total_main = fl["total"] - fl["understanding"] - fl["engram"]
     main = cfg.estimate_main_flops()
-    dev = abs(three - main) / max(1e-9, main)
+    dev = abs(total_main - main) / max(1e-9, main)
     print("  %-8s %14.1f %14.1f %13.2f%%"
-          % (tier.value, main, three, dev * 100))
+          % (tier.value, main, total_main, dev * 100))
     check(
         dev < 1e-6,
         "%s 主干口径一致" % tier.value,
-        "config=%.1fG analysis=%.1fG" % (main, three),
+        "config=%.1fG analysis=%.1fG" % (main, total_main),
     )
 
     # 断言 2：理解层 FLOPs 两个模块必须一致（此前正是此处漂移）

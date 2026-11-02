@@ -56,6 +56,7 @@ class EngramLayer(nn.Module):
         ngram: int = 3,
         num_heads: int = 4,
         decode_dim: int | None = None,
+        hash_bits: int = 16,
     ):
         super().__init__()
         self.dim = dim
@@ -63,9 +64,18 @@ class EngramLayer(nn.Module):
         self.latent_dim = latent_dim
         self.ngram = ngram
         self.num_heads = num_heads
+        # 哈希位数决定**寻址空间** 2^hash_bits，与槽位存储维度 latent_dim 解耦。
+        # 原实现把二者绑死为 16 位，于是 num_slots > 65536 时
+        # idx % num_slots == idx，索引恒小于 65536，超出的槽位永远无法命中。
+        # 实测 4MB 表（262,144 槽位）有 64.78% 的槽位零命中。
+        self.hash_bits = hash_bits
 
-        # 哈希投影：把 dim 维特征映射到 num_heads 个哈希桶（可训练）
-        self.hash_proj = nn.Linear(dim, num_heads * latent_dim, bias=False)
+        # 哈希投影：把特征映射到 num_heads 组 hash_bits 位符号（可训练）。
+        # N-Gram 模式下哈希键 = token 自身 ⊕ 其 ngram×ngram 空间邻域均值，
+        # 故输入维度翻倍（issue #4：原实现保存了 ngram 却全文件再无引用，
+        # 实际只是单 token 的 LSH，与「N-Gram 哈希检索」名实不符）。
+        in_dim = dim * 2 if ngram > 1 else dim
+        self.hash_proj = nn.Linear(in_dim, num_heads * hash_bits, bias=False)
 
         # 记忆表：INT8 缓冲区，不参与反向传播
         # （对应设计文档 R43：由"Engram 注入"流程按哈希写入）
@@ -92,20 +102,34 @@ class EngramLayer(nn.Module):
         """记忆表占用的字节数（INT8，即 size_mb 的原始口径）。"""
         return self.num_slots * self.latent_dim
 
-    def _hash(self, x: torch.Tensor) -> torch.Tensor:
+    def _hash(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
         """计算哈希槽位索引。
 
-        x: (B, N, C) -> (B, N, num_heads)
+        x: (B, N, C)，N = h*w  ->  (B, N, num_heads)
+
+        N-Gram：把 token 自身与其 ngram×ngram 邻域的均值特征拼接后再投影，
+        使哈希键包含局部空间上下文，而非只依赖单个 token。
         """
-        proj = self.hash_proj(x)  # (B, N, heads*latent)
+        if self.ngram > 1:
+            b, n, c = x.shape
+            xm = x.transpose(1, 2).reshape(b, c, h, w)
+            k = self.ngram
+            xc = F.avg_pool2d(xm, kernel_size=k, stride=1, padding=k // 2)
+            xc = xc.flatten(2).transpose(1, 2)
+            feat = torch.cat([x, xc], dim=-1)  # (B, N, 2C)
+        else:
+            feat = x
+        proj = self.hash_proj(feat)  # (B, N, heads*hash_bits)
         b, n, _ = proj.shape
-        proj = proj.reshape(b, n, self.num_heads, self.latent_dim)
-        # 用投影向量的符号做哈希（LSH 风格）
-        bits = (proj > 0).float()
-        weights = 2 ** torch.arange(
-            self.latent_dim, device=x.device, dtype=torch.float32
-        )
-        idx = (bits * weights).sum(dim=-1).long()  # (B, N, heads)
+        proj = proj.reshape(b, n, self.num_heads, self.hash_bits)
+        # 用投影向量的符号做哈希（LSH 风格）。
+        # 必须用 int64 累加：hash_bits > 24 时 float32 已无法精确表示 2^k，
+        # 会造成静默的索引碰撞。int64 可安全支持到 2^62。
+        bits = (proj > 0).to(torch.int64)
+        weights = torch.ones(
+            self.hash_bits, device=x.device, dtype=torch.int64
+        ) << torch.arange(self.hash_bits, device=x.device)
+        idx = (bits * weights).sum(dim=-1)  # (B, N, heads), int64
         return idx % self.num_slots
 
     def inject(
@@ -131,16 +155,18 @@ class EngramLayer(nn.Module):
             # 用最新的 scale（简化处理；生产环境应按层或按槽位维护）
             self.mem_scale.fill_(scale.item())
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, h: int, w: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        x: (B, N, C)
+        x: (B, N, C)，N = h*w
 
         返回
         ----
         prior    : (B, N, C) 检索到的纹理先验
         hit_rate : 标量，记忆命中率（设计文档 3.6 节指标）
         """
-        idx = self._hash(x)  # (B, N, heads)
+        idx = self._hash(x, h, w)  # (B, N, heads)
 
         # 查表 + 反量化：INT8 -> 计算精度
         # 注意：必须跟随输入 dtype，不能硬编码 .float()。
@@ -162,6 +188,77 @@ class EngramLayer(nn.Module):
         return prior, nonzero
 
 
+class DynamicEngramLayer(nn.Module):
+    """动态记忆层：记忆槽为**可训练参数**，检索走**可微软注意力**。
+
+    与 EngramLayer 的根本区别
+    -------------------------
+    EngramLayer        : INT8 静态表（register_buffer），硬哈希索引，
+                         依赖离线 inject() 写入。实测训练中该表始终全零、
+                         hash_proj 因索引不可微而无梯度，模块退化为常数偏置。
+    DynamicEngramLayer : 记忆槽是 nn.Parameter，检索是 softmax 注意力，
+                         全程可微、端到端训练，不需要任何注入流程。
+
+    设计融合了两条路线：
+      - 路线一（Engram-E2VID）：记忆从输入动态激活，而非静态存储
+      - NTC（Belcour 2026）：保留低维 latent + 轻量 MLP 解码器的结构
+
+    与 NTC 原文的差异：原文由一个大型超网络直接生成 MLP 的权重，
+    仅该映射层就需数千万参数；这里改为**记忆槽本身就是参数**，
+    以约 7.4k 参数实现同等语义，适配 8GB 显存的约束。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_slots: int = 64,
+        latent_dim: int = 16,
+        ngram: int = 3,          # 占位以兼容 Engram 的构造签名
+        num_heads: int = 4,
+        decode_dim: int | None = None,
+        hash_bits: int = 16,     # 同上，动态模式不使用
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_slots = num_slots
+        self.latent_dim = latent_dim
+
+        # 记忆槽：可训练参数（对比 EngramLayer 的 INT8 buffer）
+        self.memory = nn.Parameter(
+            torch.randn(num_slots, latent_dim) * 0.02)
+
+        self.query = nn.Linear(dim, latent_dim)
+        hidden = decode_dim or dim
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.scale = float(latent_dim) ** 0.5
+
+    @property
+    def table_bytes(self) -> int:
+        """记忆槽占用（FP32，与静态表的 INT8 口径不同）。"""
+        return self.num_slots * self.latent_dim * 4
+
+    def forward(
+        self, x: torch.Tensor, h: int | None = None, w: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # h/w 仅用于与 EngramLayer 统一签名：软注意力检索天然是全局的，
+        # 不需要空间邻域，因此这两个参数不参与计算。
+        q = self.query(x)                              # (B,N,latent)
+        logits = (q @ self.memory.t()) / self.scale     # (B,N,slots)
+        attn = torch.softmax(logits, dim=-1)
+        retrieved = attn @ self.memory                  # (B,N,latent)
+        prior = self.norm(self.decoder(retrieved))
+        # 命中率代理：注意力峰值的均值。越接近 1 说明检索越"确定"，
+        # 越接近 1/num_slots 说明记忆槽未被区分开（等价于没学到东西）。
+        with torch.no_grad():
+            hit = attn.max(dim=-1).values.mean()
+        return prior, hit
+
+
 class Engram(nn.Module):
     """分层 Engram：通用层 + 游戏层 + 用户层。
 
@@ -178,32 +275,44 @@ class Engram(nn.Module):
     def __init__(
         self,
         dim: int,
-        size_mb: int = 25,
+        size_mb: float = 25,
         ngram: int = 3,
         num_heads: int = 4,
         latent_dim: int = 16,
         enable_user_layer: bool = False,
+        hash_bits: int = 16,
+        mode: str = "static",
+        dynamic_slots: int = 64,
     ):
         super().__init__()
         self.dim = dim
         self.latent_dim = latent_dim
+        self.mode = mode
 
-        # 槽位数由 INT8 预算反推：每个槽位占 latent_dim 字节
-        bytes_total = size_mb * 1024 * 1024
-        total_slots = max(256, bytes_total // latent_dim)
+        if mode == "dynamic":
+            # 动态模式：槽位数直接指定，不按 MB 反推——记忆槽是 FP32
+            # 可训练参数，与 INT8 静态表的容量语义不同。
+            general_slots = dynamic_slots
+            game_slots = max(8, dynamic_slots // 2)
+            total_slots = general_slots + game_slots
+            layer_cls = DynamicEngramLayer
+            extra: dict = {}
+        else:
+            bytes_total = int(size_mb * 1024 * 1024)
+            total_slots = max(256, bytes_total // latent_dim)
+            general_slots = int(total_slots * 0.6)
+            game_slots = max(128, total_slots - general_slots)
+            layer_cls = EngramLayer
+            extra = {"hash_bits": hash_bits}
 
-        general_slots = int(total_slots * 0.6)
-        game_slots = max(128, total_slots - general_slots)
-
-        self.general = EngramLayer(
-            dim, general_slots, latent_dim, ngram, num_heads
-        )
-        self.game = EngramLayer(dim, game_slots, latent_dim, ngram, num_heads)
+        self.general = layer_cls(dim, general_slots, latent_dim, ngram,
+                                 num_heads, **extra)
+        self.game = layer_cls(dim, game_slots, latent_dim, ngram,
+                              num_heads, **extra)
 
         if enable_user_layer:
-            self.user = EngramLayer(
-                dim, max(64, total_slots // 8), latent_dim, ngram, num_heads
-            )
+            self.user = layer_cls(dim, max(64, total_slots // 8), latent_dim,
+                                  ngram, num_heads, **extra)
         else:
             self.user = None
 
@@ -224,17 +333,19 @@ class Engram(nn.Module):
             b += self.user.table_bytes
         return b / 1024 / 1024
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, h: int, w: int
+    ) -> dict[str, torch.Tensor]:
         """
-        x: (B, N, C)
+        x: (B, N, C)，N = h*w
 
         返回
         ----
         out      : (B, N, C) 融合后的纹理先验
         hit_rate : 平均命中率
         """
-        prior_general, hr_g = self.general(x)
-        prior_game, hr_gm = self.game(x)
+        prior_general, hr_g = self.general(x, h, w)
+        prior_game, hr_gm = self.game(x, h, w)
 
         # 门控融合
         concat = torch.cat([prior_general, prior_game], dim=-1)
@@ -247,7 +358,7 @@ class Engram(nn.Module):
 
         hit_rate = (hr_g + hr_gm) / 2
         if self.user is not None:
-            prior_user, hr_u = self.user(x)
+            prior_user, hr_u = self.user(x, h, w)
             out = out + 0.1 * prior_user
             hit_rate = (hit_rate + hr_u) / 2
 

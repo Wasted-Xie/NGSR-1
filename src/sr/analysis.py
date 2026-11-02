@@ -86,8 +86,35 @@ def estimate_flops(cfg: SRConfig) -> dict[str, float]:
     cs = cfg.shallow_channels
     shallow = 2 * (2 * 9 * n_in * cs + 2 * n_in * cs * cs)
 
-    # 输出后处理：2160p 上 1x1 Conv (C->3)
-    outpost = 2 * n_out * c * 3
+    # MoE 共享专家：HybridBlock 内除独立 FFN 外，MoE 内部另有 num_shared 个
+    # 共享专家，原公式只算了前者（issue #5 第 6 项）
+    moe_shared = L_moe * cfg.num_shared_experts * 4 * n_main * r * c * c
+
+    # ---- 以下为 issue #5 指出的漏算路径，全部在输入分辨率上执行 ----
+    # 主干上采样到输入分辨率：Conv1x1(c -> cs*4) + PixelShuffle + Conv1x1(cs -> cs)
+    main_up = n_main * 2 * c * (cs * 4) + n_in * 2 * cs * cs
+
+    # 融合：Conv1x1(2cs -> c) + GELU + DW3x3(c) + PW1x1(c)
+    fuse = n_in * (2 * (cs * 2) * c + 2 * 9 * c + 2 * c * c)
+
+    # 高精度旁路：edge/texture(c -> ch, 3x3) + direction(c -> 4, 3x3)
+    #            + compress(2ch+4 -> ch, 1x1) + DW3x3(ch) + expand(ch -> c, 1x1)
+    ch = cfg.bypass_channels
+    bypass = n_in * (
+        2 * 9 * c * ch * 2
+        + 2 * 9 * c * 4
+        + 2 * (ch * 2 + 4) * ch
+        + 2 * 9 * ch
+        + 2 * ch * c
+    )
+    bypass_proj = n_in * 2 * c * c
+
+    # 输出上采样：Conv1x1(c -> 12) + PixelShuffle + Conv1x1(3 -> 3)
+    upsampler = n_in * 2 * c * 12 + n_out * 2 * 9
+
+    # 输出后处理：Conv1x1(3 -> 3)。
+    # 原公式为 2*n_out*c*3（按 c->3 的 1x1 算），与实现中的 Conv2d(3,3,1) 不符。
+    outpost = n_out * 2 * 9
 
     # 理解层：直接复用 config 的权威实现，避免此处与 config 各写一套公式后漂移
     # （单位已是 G）
@@ -97,13 +124,21 @@ def estimate_flops(cfg: SRConfig) -> dict[str, float]:
     engram = 2 * n_main * 16 * c * 2
 
     G = 1e9
-    total = attn + shared + private + shallow + outpost + und * G + engram
+    total = (attn + shared + private + moe_shared + shallow
+             + main_up + fuse + bypass + bypass_proj + upsampler + outpost
+             + und * G + engram)
 
     return {
         "attention": attn / G,
         "shared_ffn": shared / G,
         "private_experts": private / G,
+        "moe_shared_experts": moe_shared / G,
         "shallow": shallow / G,
+        "main_upsample": main_up / G,
+        "fuse": fuse / G,
+        "bypass": bypass / G,
+        "bypass_proj": bypass_proj / G,
+        "upsampler": upsampler / G,
         "output_post": outpost / G,
         "understanding": und,
         "engram": engram / G,

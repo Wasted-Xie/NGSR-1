@@ -85,6 +85,9 @@ class SuperResolutionModel(nn.Module):
         self.engram = Engram(
             dim=c,
             size_mb=config.engram_size_mb,
+            hash_bits=config.engram_hash_bits,
+            mode=config.engram_mode,
+            dynamic_slots=config.engram_dynamic_slots,
             ngram=config.engram_ngram,
             num_heads=config.engram_heads,
         )

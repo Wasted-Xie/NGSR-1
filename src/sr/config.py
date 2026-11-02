@@ -94,10 +94,21 @@ class SRConfig:
     moe_layers: int | None = None
 
     # ---------- Engram ----------
-    engram_size_mb: int = 25
+    engram_size_mb: float = 25
+    # Engram 哈希寻址位数：地址空间为 2^engram_hash_bits。
+    # 必须使 2^bits 不小于单层槽位数，否则超出地址空间部分的槽位
+    # 永远不会被命中（原实现硬编码 16 位，实测 4MB 表 64.78% 为零命中）。
+    engram_hash_bits: int = 16
+    # Engram 模式：
+    #   "static"  — INT8 静态表 + 硬哈希索引（依赖离线 inject 写入；
+    #               实测训练中该表恒为零，模块会退化为常数偏置）
+    #   "dynamic" — 可训练记忆槽 + 可微软注意力（端到端，无需注入）
+    engram_mode: str = "static"
+    engram_dynamic_slots: int = 64
     engram_ngram: int = 3  # N-Gram 长度
     engram_heads: int = 4  # 哈希头数
-    engram_quant: QuantScheme = QuantScheme.W8A8
+    # 说明（issue #6）：原 engram_quant 声明项已被删除——记忆表恒为 int8，
+    # 与配置无关，留着只会造成"配置存在即已实现"的误读。
 
     # ---------- 理解层 ----------
     # R53：理解层置于第一层
@@ -147,7 +158,6 @@ class SRConfig:
     # ---------- 量化 ----------
     # 可选范围（设计文档 4.1 节量化策略表）：
     #   expert_quant : TERNARY / W4A8 / W8A8 / FP16
-    #   main_quant   : W4A8 / W8A8 / FP16
     #   bypass_quant : W8A8 / FP8 / FP16
     #
     # 旁路精度说明（用户放宽，取代设计文档原「旁路建议 FP16」）：
@@ -158,13 +168,23 @@ class SRConfig:
     # 接线状态：bypass_quant 已接入 HighPrecisionBypass 与 bypass_proj
     #   （伪量化实现见 quant.py）。可选范围见 validate()：旁路是质量保障
     #   路径，不接受 TERNARY / W4A8 这类激进位宽。
+    # 说明（issue #6）：主干量化（W8A8）原以 main_quant 声明，但**从未接线**——
+    #   主干全部是 FP32 的 nn.Linear/nn.Conv2d，只有旁路走 QuantConv2d。
+    #   而 estimate_weight_memory_mb 却按 expert_quant 的位宽估算全模型权重显存，
+    #   会得出偏乐观的结论。为避免配置与实现长期不符，删除该声明；
+    #   将来若实现主干量化，需连同显存估算口径一并修正。
     expert_quant: QuantScheme = QuantScheme.TERNARY
-    main_quant: QuantScheme = QuantScheme.W8A8
     bypass_quant: QuantScheme = QuantScheme.FP16
 
     # ---------- 后处理 ----------
     sharpness: float = 0.5  # 锐度 0~1
-    antialiasing: float = 0.5  # 抗锯齿强度 0~1
+    # 说明（issue #6）：原 antialiasing 声明项已删除——后处理只消费 sharpness，
+    #   抗锯齿未实现。
+
+    #   bypass_activation 的接线说明（issue #6 / #7）：
+    #   该值原先只被 validate() 校验、从未参与计算，旁路对所有 token 稠密计算，
+    #   门控是学出来的裸 sigmoid。现已接入训练损失（见 scripts/train_base.py 的
+    #   gate 稀疏正则项），约束平均门控概率逼近本值。
 
     # ---------- 派生属性 ----------
     @property
@@ -253,29 +273,61 @@ class SRConfig:
     def estimate_main_flops(self) -> float:
         """主干单帧 FLOPs（G），口径同设计文档 5.2.7 节。
 
-        含三部分，即「留给重建主干（含专家团）」的完整算力：
-          窗口注意力   : L × (8Nc² + 4Nw²c)
-          共享专家 FFN : L × 4Nrc²
-          私有专家     : L_moe × K × 4Nrc²
+        含重建主干与重建路径的全部算力：
+          窗口注意力    : L × (8Nc² + 4Nw²c)
+          独立 FFN      : L × 4Nrc²
+          MoE 共享专家  : L_moe × num_shared × 4Nrc²
+          私有专家      : L_moe × K × 4Nrc²
+          重建路径      : 主干上采样 + 融合 + 高精度旁路 + 输出上采样/后处理
 
-        口径修订说明（已与用户确认）：
-          本方法原先只统计窗口注意力，但 understanding_compute_budget 的语义是
-          「理解层不吃掉留给重建主干的算力」，分母若漏掉 FFN 与专家就低估了主干
-          规模、把预算卡得过紧。补全后理解层算力占比由 21%~32% 变为 4.7%~12.9%，
-          仍远低于 35% 预算（说明原口径下理解层规模被无谓压小）。
+        口径修订说明：
+          本方法原先只统计窗口注意力，后补入 FFN 与专家，理解层占比由
+          21%~32% 降至 4.7%~12.9%。但 issue #5 指出，仍漏算了 fuse /
+          HighPrecisionBypass / bypass_proj / main_upsample / upsampler
+          及 MoE 共享专家——这些路径实际在**输入分辨率**上执行，开销随
+          分辨率线性增长，是重建路径的大头。漏算会继续低估分母，使
+          「理解层占比」虚高，进而把理解层规模压得过小。
+          本次按实现逐项补全，口径与 analysis.estimate_flops 保持一致。
         """
         n = self.main_height * self.main_width
+        n_in = self.input_height * self.input_width
+        n_out = self.output_height * self.output_width
         c = self.main_channels
         w = self.window_size
         r = self.ffn_ratio
         k = self.top_k
         layers = self.main_blocks
         layers_moe = self.effective_moe_layers
+        cs = self.shallow_channels
+        ch = self.bypass_channels
 
         attn = layers * (8 * n * c * c + 4 * n * w * w * c)
         shared = layers * 4 * n * r * c * c
+        moe_shared = layers_moe * self.num_shared_experts * 4 * n * r * c * c
         private = layers_moe * k * 4 * n * r * c * c
-        return (attn + shared + private) / 1e9
+
+        # 主干上采样到输入分辨率
+        main_up = n * 2 * c * (cs * 4) + n_in * 2 * cs * cs
+        # 融合：Conv1x1(2cs -> c) + DW3x3(c) + PW1x1(c)
+        fuse = n_in * (2 * (cs * 2) * c + 2 * 9 * c + 2 * c * c)
+        # 高精度旁路（六个卷积，均在输入分辨率）
+        bypass = n_in * (
+            2 * 9 * c * ch * 2
+            + 2 * 9 * c * 4
+            + 2 * (ch * 2 + 4) * ch
+            + 2 * 9 * ch
+            + 2 * ch * c
+        )
+        bypass_proj = n_in * 2 * c * c
+        # 浅层细节路：输入分辨率上的两套 DW3x3 + PW1x1（与 analysis 同式）
+        shallow = 2 * (2 * 9 * n_in * cs + 2 * n_in * cs * cs)
+        # 输出上采样 + 后处理
+        upsampler = n_in * 2 * c * 12 + n_out * 2 * 9
+        post = n_out * 2 * 9
+
+        total = (attn + shared + moe_shared + private + shallow
+                 + main_up + fuse + bypass + bypass_proj + upsampler + post)
+        return total / 1e9
 
     @property
     def understanding_compute_ratio(self) -> float:
