@@ -11,3 +11,10 @@
 *.pth   binary
 *.whl   binary
 *.zip   binary
+
+# C 头文件带 UTF-8 BOM。
+# 原因：MSVC 在中文（代码页 936）环境下会把无 BOM 的 UTF-8 源文件按 GBK 解释，
+# 对含中文注释的头文件触发 C4819；若调用方开了 /WX 就直接编译失败。头文件是要被
+# 第三方 #include 的，让它自带编码声明，比要求集成方加 /utf-8 更可靠。
+# 实测：加 BOM 后 MSVC 在 /W4 /WX 下 C / C++ 两种模式均可编译通过。
+include/*.h  text eol=lf
